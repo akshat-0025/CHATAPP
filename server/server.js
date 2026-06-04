@@ -9,12 +9,17 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import { MongoMemoryServer } from 'mongodb-memory-server';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 import User from './models/User.js';
 import Message from './models/Message.js';
 import auth from './middleware/auth.js';
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = http.createServer(app);
@@ -390,6 +395,18 @@ io.on('connection', async (socket) => {
       }
     }
   });
+});
+
+// Serve static assets in production
+const clientDistPath = path.join(__dirname, '../client/dist');
+app.use(express.static(clientDistPath));
+
+// For client-side routing, serve index.html for all other routes
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) {
+    return next();
+  }
+  res.sendFile(path.join(clientDistPath, 'index.html'));
 });
 
 // Start Server
