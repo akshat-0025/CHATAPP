@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { 
   Send, Search, LogOut, MessageSquare, Check, CheckCheck, 
-  Info, X, ChevronRight, User, CircleDot, AlertCircle 
+  Info, X, ChevronRight, User, CircleDot, AlertCircle, ChevronLeft 
 } from 'lucide-react';
 
 export default function Dashboard({ socket, user, token, onLogout }) {
@@ -282,7 +282,9 @@ export default function Dashboard({ socket, user, token, onLogout }) {
       <div className="flex flex-1 relative z-10 w-full h-full">
         
         {/* PANEL 1: Left Contacts Sidebar */}
-        <aside className="w-80 md:w-96 flex flex-col border-r border-white/5 bg-dark-950/40 backdrop-blur-md h-full shrink-0">
+        <aside className={`flex flex-col border-r border-white/5 bg-dark-950/40 backdrop-blur-md h-full shrink-0 transition-all duration-300 ${
+          activeContactId ? 'hidden md:flex w-80 md:w-96' : 'flex w-full md:w-96'
+        }`}>
           
           {/* Sidebar Header */}
           <div className="p-4 border-b border-white/5 flex items-center justify-between">
@@ -419,12 +421,21 @@ export default function Dashboard({ socket, user, token, onLogout }) {
         </aside>
 
         {/* PANEL 2: Center Active Chat View */}
-        <main className="flex-1 flex flex-col bg-dark-900/30 h-full min-w-0">
+        <main className={`flex-1 flex flex-col bg-dark-900/30 h-full min-w-0 transition-all duration-300 ${
+          activeContactId ? 'flex w-full' : 'hidden md:flex'
+        }`}>
           {activeContact ? (
             <>
               {/* Chat Header */}
               <header className="p-4 border-b border-white/5 bg-dark-950/20 backdrop-blur-md flex items-center justify-between shrink-0">
                 <div className="flex items-center gap-3 min-w-0">
+                  {/* Back button on mobile */}
+                  <button
+                    onClick={() => setActiveContactId(null)}
+                    className="md:hidden mr-1 p-2 rounded-xl text-dark-400 hover:text-white hover:bg-white/5 transition-all duration-200 cursor-pointer"
+                  >
+                    <ChevronLeft className="w-5 h-5" />
+                  </button>
                   {/* Recipient Avatar */}
                   <div className={`w-10 h-10 rounded-xl bg-gradient-to-br ${activeContact.avatarColor} flex items-center justify-center text-lg`}>
                     {activeContact.avatarEmoji}
@@ -484,7 +495,7 @@ export default function Dashboard({ socket, user, token, onLogout }) {
                         key={msg._id || idx}
                         className={`flex ${isSelf ? 'justify-end' : 'justify-start'} group`}
                       >
-                        <div className={`max-w-[70%] flex flex-col ${isSelf ? 'items-end' : 'items-start'}`}>
+                        <div className={`max-w-[85%] md:max-w-[70%] flex flex-col ${isSelf ? 'items-end' : 'items-start'}`}>
                           {/* Chat bubble body */}
                           <div className={`p-3 rounded-2xl text-sm relative transition-all duration-200 shadow-md ${
                             isSelf
@@ -580,7 +591,7 @@ export default function Dashboard({ socket, user, token, onLogout }) {
 
         {/* PANEL 3: Collapsible Details Panel */}
         {activeContact && showDetailPanel && (
-          <aside className="w-80 border-l border-white/5 bg-dark-950/40 backdrop-blur-md h-full flex flex-col shrink-0 animate-fade-in">
+          <aside className="fixed inset-y-0 right-0 z-50 w-full sm:w-80 border-l border-white/5 bg-dark-950/95 md:bg-dark-950/40 md:relative backdrop-blur-md h-full flex flex-col shrink-0 animate-fade-in">
             {/* Header */}
             <div className="p-4 border-b border-white/5 flex items-center justify-between">
               <span className="font-semibold text-white text-sm">Contact Information</span>
