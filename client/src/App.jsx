@@ -63,7 +63,7 @@ export default function App() {
   };
 
   return (
-    <div className="w-full h-screen bg-[#030712]">
+    <div className="w-full h-dvh bg-[#030712]">
       {token && user ? (
         <Dashboard 
           socket={socket} 

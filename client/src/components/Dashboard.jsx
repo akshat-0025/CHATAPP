@@ -15,7 +15,7 @@ export default function Dashboard({ socket, user, token, onLogout }) {
   const [connected, setConnected] = useState(socket ? socket.connected : false);
   const [apiError, setApiError] = useState('');
 
-  const messagesEndRef = useRef(null);
+  const messageContainerRef = useRef(null);
   const typingTimeoutRef = useRef(null);
 
   const activeContact = contacts.find(c => c.id === activeContactId);
@@ -170,7 +170,9 @@ export default function Dashboard({ socket, user, token, onLogout }) {
   }, [activeContactId]);
 
   const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (messageContainerRef.current) {
+      messageContainerRef.current.scrollTop = messageContainerRef.current.scrollHeight;
+    }
   };
 
   const userId = user.id;
@@ -273,7 +275,7 @@ export default function Dashboard({ socket, user, token, onLogout }) {
   );
 
   return (
-    <div className="flex h-screen bg-dark-950 text-gray-200 overflow-hidden font-sans relative">
+    <div className="flex h-dvh bg-dark-950 text-gray-200 overflow-hidden font-sans relative">
       {/* Background glow effects */}
       <div className="absolute top-[-10%] right-[-10%] w-[500px] h-[500px] bg-brand-600/5 rounded-full blur-[120px] pointer-events-none"></div>
       <div className="absolute bottom-[-10%] left-[-10%] w-[500px] h-[500px] bg-accent-blue/5 rounded-full blur-[120px] pointer-events-none"></div>
@@ -466,7 +468,7 @@ export default function Dashboard({ socket, user, token, onLogout }) {
               </header>
 
               {/* Message Feed Container */}
-              <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              <div ref={messageContainerRef} className="flex-1 overflow-y-auto p-4 space-y-4">
                 {messages.length === 0 ? (
                   <div className="flex flex-col items-center justify-center h-full text-center text-dark-500">
                     <div className="w-12 h-12 rounded-2xl bg-white/5 flex items-center justify-center mb-3">
@@ -521,8 +523,7 @@ export default function Dashboard({ socket, user, token, onLogout }) {
                     );
                   })
                 )}
-                {/* Reference for scroll-to-bottom */}
-                <div ref={messagesEndRef} />
+                {/* End of message list */}
               </div>
 
               {/* Recipient Typing Indicator bubble */}
