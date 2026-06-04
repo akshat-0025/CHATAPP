@@ -204,11 +204,39 @@ app.get('/api/auth/me', auth, async (req, res) => {
   }
 });
 
-// Get Contacts (All Registered Users)
+// Helper to get active chat partner IDs for a user
+const getActiveChatPartners = async (userId) => {
+  try {
+    const uId = new mongoose.Types.ObjectId(userId);
+    const partners = await Message.aggregate([
+      { $match: { $or: [{ sender: uId }, { recipient: uId }] } },
+      {
+        $project: {
+          partner: {
+            $cond: {
+              if: { $eq: ['$sender', uId] },
+              then: '$recipient',
+              else: '$sender'
+            }
+          }
+        }
+      },
+      { $group: { _id: '$partner' } }
+    ]);
+    return partners.map(p => p._id);
+  } catch (err) {
+    console.error('Error getting active partners:', err);
+    return [];
+  }
+};
+
+// Get Contacts (Only users with active chat history)
 app.get('/api/users', auth, async (req, res) => {
   try {
-    // Return all users except the requester
-    const users = await User.find({ _id: { $ne: req.user.id } })
+    const partnerIds = await getActiveChatPartners(req.user.id);
+
+    // Return users that are active chat partners
+    const users = await User.find({ _id: { $in: partnerIds } })
       .select('-password')
       .sort({ online: -1, username: 1 });
 
@@ -246,6 +274,59 @@ app.get('/api/users', auth, async (req, res) => {
     res.json(usersWithLastMessage);
   } catch (error) {
     console.error('Fetch users error:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
+// Search a user by exact username (private lookup for starting a new conversation)
+app.post('/api/users/search', auth, async (req, res) => {
+  try {
+    const { username } = req.body;
+    if (!username || !username.trim()) {
+      return res.status(400).json({ message: 'Username is required.' });
+    }
+
+    const targetUsername = username.trim();
+    if (targetUsername.toLowerCase() === req.user.username.toLowerCase()) {
+      return res.status(400).json({ message: 'You cannot chat with yourself.' });
+    }
+
+    // Find user by exact match (case-insensitive)
+    const user = await User.findOne({ username: { $regex: new RegExp(`^${targetUsername}$`, 'i') } }).select('-password');
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found. Please verify the exact spelling.' });
+    }
+
+    const lastMessage = await Message.findOne({
+      $or: [
+        { sender: req.user.id, recipient: user._id },
+        { sender: user._id, recipient: req.user.id }
+      ]
+    }).sort({ createdAt: -1 });
+
+    const unreadCount = await Message.countDocuments({
+      sender: user._id,
+      recipient: req.user.id,
+      read: false
+    });
+
+    res.json({
+      id: user._id,
+      username: user.username,
+      avatarColor: user.avatarColor,
+      avatarEmoji: user.avatarEmoji,
+      online: user.online,
+      lastSeen: user.lastSeen,
+      lastMessage: lastMessage ? {
+        text: lastMessage.text,
+        sender: lastMessage.sender,
+        createdAt: lastMessage.createdAt
+      } : null,
+      unreadCount
+    });
+  } catch (error) {
+    console.error('Search user error:', error);
     res.status(500).json({ message: 'Internal server error.' });
   }
 });
@@ -301,12 +382,15 @@ io.on('connection', async (socket) => {
   // Map user ID to socket
   userSockets.set(userId, socket.id);
   
-  // Set user to online and broadcast
+  // Set user to online and broadcast to active chat partners only
   try {
     await User.findByIdAndUpdate(userId, { online: true });
-    socket.broadcast.emit('user_status', {
-      userId,
-      online: true
+    const partners = await getActiveChatPartners(userId);
+    partners.forEach(partnerId => {
+      io.to(partnerId.toString()).emit('user_status', {
+        userId,
+        online: true
+      });
     });
   } catch (err) {
     console.error('Error updating status on connect:', err);
@@ -384,11 +468,14 @@ io.on('connection', async (socket) => {
           lastSeen: lastSeenTime 
         });
 
-        // Broadcast offline status to all clients
-        socket.broadcast.emit('user_status', {
-          userId,
-          online: false,
-          lastSeen: lastSeenTime
+        // Broadcast status ONLY to active chat partners
+        const partners = await getActiveChatPartners(userId);
+        partners.forEach(partnerId => {
+          io.to(partnerId.toString()).emit('user_status', {
+            userId,
+            online: false,
+            lastSeen: lastSeenTime
+          });
         });
       } catch (err) {
         console.error('Error updating status on disconnect:', err);

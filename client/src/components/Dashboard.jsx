@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { 
   Send, Search, LogOut, MessageSquare, Check, CheckCheck, 
-  Info, X, ChevronRight, User, CircleDot, AlertCircle, ChevronLeft 
+  Info, X, ChevronRight, User, CircleDot, AlertCircle, ChevronLeft,
+  Plus
 } from 'lucide-react';
 
 export default function Dashboard({ socket, user, token, onLogout }) {
@@ -14,6 +15,12 @@ export default function Dashboard({ socket, user, token, onLogout }) {
   const [typingStates, setTypingStates] = useState({}); // userId -> boolean
   const [connected, setConnected] = useState(socket ? socket.connected : false);
   const [apiError, setApiError] = useState('');
+
+  // Start New Chat Modal States
+  const [showNewChatModal, setShowNewChatModal] = useState(false);
+  const [newChatUsername, setNewChatUsername] = useState('');
+  const [newChatError, setNewChatError] = useState('');
+  const [newChatLoading, setNewChatLoading] = useState(false);
 
   const messageContainerRef = useRef(null);
   const typingTimeoutRef = useRef(null);
@@ -220,6 +227,49 @@ export default function Dashboard({ socket, user, token, onLogout }) {
     }
   };
 
+  const handleStartNewChat = async (e) => {
+    e.preventDefault();
+    if (!newChatUsername.trim()) return;
+
+    setNewChatLoading(true);
+    setNewChatError('');
+
+    try {
+      const response = await fetch('/api/users/search', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ username: newChatUsername.trim() })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.message || 'User not found');
+      }
+
+      // Add to contacts list if not already present
+      setContacts(prev => {
+        const exists = prev.some(c => c.id === data.id);
+        if (exists) return prev;
+        return [data, ...prev];
+      });
+
+      // Set as active chat
+      setActiveContactId(data.id);
+
+      // Close modal
+      setShowNewChatModal(false);
+      setNewChatUsername('');
+    } catch (err) {
+      setNewChatError(err.message || 'Failed to start chat');
+    } finally {
+      setNewChatLoading(false);
+    }
+  };
+
   // Group messages list by Date (Today, Yesterday, DateString)
   const groupMessagesByDate = (messagesList) => {
     const groups = [];
@@ -304,14 +354,25 @@ export default function Dashboard({ socket, user, token, onLogout }) {
               </div>
             </div>
 
-            {/* Logout Action */}
-            <button
-              onClick={onLogout}
-              title="Logout"
-              className="p-2.5 rounded-xl text-dark-400 hover:text-white hover:bg-white/5 transition-all duration-200 cursor-pointer"
-            >
-              <LogOut className="w-4.5 h-4.5" />
-            </button>
+            <div className="flex items-center gap-1">
+              {/* New Chat Action */}
+              <button
+                onClick={() => setShowNewChatModal(true)}
+                title="New Chat"
+                className="p-2.5 rounded-xl text-dark-400 hover:text-white hover:bg-white/5 transition-all duration-200 cursor-pointer"
+              >
+                <Plus className="w-4.5 h-4.5" />
+              </button>
+
+              {/* Logout Action */}
+              <button
+                onClick={onLogout}
+                title="Logout"
+                className="p-2.5 rounded-xl text-dark-400 hover:text-white hover:bg-white/5 transition-all duration-200 cursor-pointer"
+              >
+                <LogOut className="w-4.5 h-4.5" />
+              </button>
+            </div>
           </div>
 
           {/* Search bar */}
@@ -355,7 +416,7 @@ export default function Dashboard({ socket, user, token, onLogout }) {
               <div className="flex flex-col items-center justify-center p-8 text-center text-dark-500">
                 <User className="w-10 h-10 mb-2 opacity-30" />
                 <p className="text-sm">No contacts found</p>
-                <p className="text-xs mt-1">Register other accounts to chat</p>
+                <p className="text-xs mt-1">Use the "+" button above to start a private chat.</p>
               </div>
             ) : (
               filteredContacts.map(contact => {
@@ -657,6 +718,80 @@ export default function Dashboard({ socket, user, token, onLogout }) {
             </div>
           </aside>
         )}
+
+      {/* Start New Chat Modal */}
+      {showNewChatModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in animate-duration-200">
+          <div className="w-full max-w-md glass-card rounded-2xl shadow-2xl p-6 relative overflow-hidden border border-white/5">
+            {/* Decorative Top Glow Bar */}
+            <div className="absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r from-brand-500 to-accent-blue"></div>
+            
+            {/* Modal Header */}
+            <div className="flex justify-between items-start mb-4">
+              <div>
+                <h3 className="text-lg font-bold text-white">Start New Chat</h3>
+                <p className="text-xs text-dark-400 mt-1">
+                  Enter the exact username of the person you want to talk to.
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  setShowNewChatModal(false);
+                  setNewChatUsername('');
+                  setNewChatError('');
+                }}
+                className="p-1 rounded-lg text-dark-400 hover:text-white hover:bg-white/5 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <form onSubmit={handleStartNewChat} className="space-y-4">
+              {newChatError && (
+                <div className="p-3 bg-accent-rose/10 border border-accent-rose/20 text-accent-rose text-xs rounded-xl">
+                  {newChatError}
+                </div>
+              )}
+              
+              <div className="space-y-2">
+                <label className="block text-xs font-semibold text-dark-300 uppercase tracking-wider">
+                  Username
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. bob"
+                  value={newChatUsername}
+                  onChange={(e) => setNewChatUsername(e.target.value)}
+                  className="w-full px-4 py-3 rounded-xl text-white placeholder-dark-500 text-sm glass-input"
+                  autoFocus
+                />
+              </div>
+
+              <div className="flex justify-end gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowNewChatModal(false);
+                    setNewChatUsername('');
+                    setNewChatError('');
+                  }}
+                  className="px-4 py-2 text-xs font-semibold rounded-xl text-dark-300 hover:text-white transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={newChatLoading || !newChatUsername.trim()}
+                  className="px-4 py-2 text-xs font-semibold rounded-xl bg-gradient-to-r from-brand-600 to-brand-500 text-white shadow-md hover:from-brand-500 hover:to-brand-600 transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {newChatLoading ? 'Searching...' : 'Start Chat'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       </div>
     </div>
