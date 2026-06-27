@@ -14,7 +14,9 @@ import { fileURLToPath } from 'url';
 
 import User from './models/User.js';
 import Message from './models/Message.js';
+import ChatLink from './models/ChatLink.js';
 import auth from './middleware/auth.js';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -348,6 +350,100 @@ app.get('/api/messages/:userId', auth, async (req, res) => {
   }
 });
 
+// Create a new shareable invite link
+app.post('/api/chat-links', auth, async (req, res) => {
+  try {
+    const { expiresType } = req.body;
+    if (!expiresType || !['1h', '24h', '7d', 'never'].includes(expiresType)) {
+      return res.status(400).json({ message: 'Invalid or missing expiration type.' });
+    }
+
+    // Generate a unique 8-character uppercase alpha-numeric code
+    let code;
+    let exists = true;
+    while (exists) {
+      code = Math.random().toString(36).substring(2, 10).toUpperCase();
+      const existing = await ChatLink.findOne({ code });
+      if (!existing) exists = false;
+    }
+
+    let expiresAt = null;
+    if (expiresType === '1h') {
+      expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+    } else if (expiresType === '24h') {
+      expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    } else if (expiresType === '7d') {
+      expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    }
+
+    const newLink = new ChatLink({
+      code,
+      creator: req.user.id,
+      expiresAt,
+      expiresType
+    });
+
+    await newLink.save();
+    res.status(201).json({ code, expiresAt });
+  } catch (error) {
+    console.error('Create chat link error:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
+// Accept a shareable invite link
+app.post('/api/chat-links/:code/accept', auth, async (req, res) => {
+  try {
+    const { code } = req.params;
+    const link = await ChatLink.findOne({ code }).populate('creator', '-password');
+
+    if (!link) {
+      return res.status(404).json({ message: 'Invalid or expired chat link.' });
+    }
+
+    if (link.expiresAt && link.expiresAt < new Date()) {
+      await ChatLink.deleteOne({ _id: link._id });
+      return res.status(400).json({ message: 'This chat link has expired.' });
+    }
+
+    if (link.creator._id.toString() === req.user.id) {
+      return res.status(400).json({ message: 'You cannot use your own chat link.' });
+    }
+
+    // Connect them instantly by creating a system message if no prior messages exist
+    const existingMessage = await Message.findOne({
+      $or: [
+        { sender: req.user.id, recipient: link.creator._id },
+        { sender: link.creator._id, recipient: req.user.id }
+      ]
+    });
+
+    if (!existingMessage) {
+      const systemMessage = new Message({
+        sender: link.creator._id, // from creator
+        recipient: req.user.id, // to visitor
+        text: 'System: Secure duo chat session established via private link.'
+      });
+      await systemMessage.save();
+    }
+
+    res.json({
+      creator: {
+        id: link.creator._id,
+        username: link.creator.username,
+        avatarColor: link.creator.avatarColor,
+        avatarEmoji: link.creator.avatarEmoji,
+        statusMessage: link.creator.statusMessage || 'Available',
+        online: link.creator.online,
+        lastSeen: link.creator.lastSeen
+      }
+    });
+  } catch (error) {
+    console.error('Accept chat link error:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
 // Socket.IO Real-time Logic
 const io = new Server(server, {
   cors: {
@@ -400,17 +496,26 @@ io.on('connection', async (socket) => {
   socket.join(userId);
 
   // Handle incoming private message
-  socket.on('private_message', async ({ recipientId, text }, callback) => {
+  socket.on('private_message', async ({ recipientId, text, selfDestructType }, callback) => {
     try {
       if (!text || !text.trim()) {
         if (callback) callback({ success: false, error: 'Message content is empty' });
         return;
       }
 
+      let destructAt = null;
+      if (selfDestructType === '1h') {
+        destructAt = new Date(Date.now() + 60 * 60 * 1000);
+      } else if (selfDestructType === '24h') {
+        destructAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      }
+
       const message = new Message({
         sender: userId,
         recipient: recipientId,
-        text: text.trim()
+        text: text.trim(),
+        selfDestructType: selfDestructType || 'forever',
+        destructAt
       });
 
       await message.save();
@@ -438,11 +543,38 @@ io.on('connection', async (socket) => {
   // Handle message read receipts
   socket.on('read_receipt', async ({ senderId }) => {
     try {
-      // Mark all messages from senderId to current user as read
+      // Find all unread messages from senderId to current user
+      const unreadMsgs = await Message.find({
+        sender: senderId,
+        recipient: userId,
+        read: false
+      });
+
+      // Mark messages as read in DB
       await Message.updateMany(
         { sender: senderId, recipient: userId, read: false },
         { $set: { read: true } }
       );
+
+      // Trigger self-destruct timers for 'after_read' messages
+      const afterReadMsgs = unreadMsgs.filter(m => m.selfDestructType === 'after_read');
+      for (const msg of afterReadMsgs) {
+        const destructTime = new Date(Date.now() + 10000); // 10s countdown
+        await Message.findByIdAndUpdate(msg._id, { 
+          destructAt: destructTime,
+          read: true
+        });
+
+        // Notify both clients that destruct countdown has started
+        io.to(senderId).emit('message_destruct_timer_started', {
+          messageId: msg._id,
+          destructAt: destructTime
+        });
+        io.to(userId).emit('message_destruct_timer_started', {
+          messageId: msg._id,
+          destructAt: destructTime
+        });
+      }
 
       // Notify the original sender that their messages were read
       socket.to(senderId).emit('messages_read', {
@@ -450,6 +582,171 @@ io.on('connection', async (socket) => {
       });
     } catch (err) {
       console.error('Error updating read receipts:', err);
+    }
+  });
+
+  // Handle message editing
+  socket.on('edit_message', async ({ messageId, text }, callback) => {
+    try {
+      const message = await Message.findById(messageId);
+      if (!message) {
+        if (callback) callback({ success: false, error: 'Message not found' });
+        return;
+      }
+      if (message.sender.toString() !== userId) {
+        if (callback) callback({ success: false, error: 'Unauthorized' });
+        return;
+      }
+      if (message.isDeleted) {
+        if (callback) callback({ success: false, error: 'Cannot edit deleted message' });
+        return;
+      }
+
+      message.text = text.trim();
+      message.isEdited = true;
+      await message.save();
+
+      // Emit update to both parties
+      io.to(message.recipient.toString()).emit('message_edited', {
+        messageId,
+        text: message.text,
+        isEdited: true
+      });
+      socket.emit('message_edited', {
+        messageId,
+        text: message.text,
+        isEdited: true
+      });
+
+      if (callback) callback({ success: true, message });
+    } catch (err) {
+      console.error('Edit message error:', err);
+      if (callback) callback({ success: false, error: 'Failed to edit message' });
+    }
+  });
+
+  // Handle message deletion
+  socket.on('delete_message', async ({ messageId }, callback) => {
+    try {
+      const message = await Message.findById(messageId);
+      if (!message) {
+        if (callback) callback({ success: false, error: 'Message not found' });
+        return;
+      }
+      if (message.sender.toString() !== userId) {
+        if (callback) callback({ success: false, error: 'Unauthorized' });
+        return;
+      }
+
+      message.text = 'This message was deleted';
+      message.isDeleted = true;
+      message.isEdited = false;
+      await message.save();
+
+      // Emit update to both parties
+      io.to(message.recipient.toString()).emit('message_deleted', {
+        messageId,
+        text: message.text,
+        isDeleted: true
+      });
+      socket.emit('message_deleted', {
+        messageId,
+        text: message.text,
+        isDeleted: true
+      });
+
+      if (callback) callback({ success: true, message });
+    } catch (err) {
+      console.error('Delete message error:', err);
+      if (callback) callback({ success: false, error: 'Failed to delete message' });
+    }
+  });
+
+  // Handle message reactions
+  socket.on('react_message', async ({ messageId, emoji }, callback) => {
+    try {
+      const message = await Message.findById(messageId);
+      if (!message) {
+        if (callback) callback({ success: false, error: 'Message not found' });
+        return;
+      }
+
+      if (message.sender.toString() !== userId && message.recipient.toString() !== userId) {
+        if (callback) callback({ success: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const existingIndex = message.reactions.findIndex(
+        r => r.userId === userId && r.emoji === emoji
+      );
+
+      if (existingIndex > -1) {
+        // Toggle off
+        message.reactions.splice(existingIndex, 1);
+      } else {
+        // Toggle on
+        message.reactions.push({
+          userId,
+          username: socket.user.username,
+          emoji
+        });
+      }
+
+      await message.save();
+
+      io.to(message.recipient.toString()).emit('message_reacted', {
+        messageId,
+        reactions: message.reactions
+      });
+      socket.emit('message_reacted', {
+        messageId,
+        reactions: message.reactions
+      });
+
+      if (callback) callback({ success: true, reactions: message.reactions });
+    } catch (err) {
+      console.error('Reaction message error:', err);
+      if (callback) callback({ success: false, error: 'Failed to react to message' });
+    }
+  });
+
+  // Handle anonymous profile updates
+  socket.on('update_profile', async ({ avatarEmoji, avatarColor, statusMessage }, callback) => {
+    try {
+      const updatedUser = await User.findByIdAndUpdate(
+        userId,
+        { avatarEmoji, avatarColor, statusMessage },
+        { new: true }
+      ).select('-password');
+
+      if (!updatedUser) {
+        if (callback) callback({ success: false, error: 'User not found' });
+        return;
+      }
+
+      // Broadcast update to all active chat partners
+      const partners = await getActiveChatPartners(userId);
+      partners.forEach(partnerId => {
+        io.to(partnerId.toString()).emit('user_profile_updated', {
+          userId,
+          avatarEmoji: updatedUser.avatarEmoji,
+          avatarColor: updatedUser.avatarColor,
+          statusMessage: updatedUser.statusMessage
+        });
+      });
+
+      const formattedUser = {
+        id: updatedUser._id,
+        username: updatedUser.username,
+        avatarColor: updatedUser.avatarColor,
+        avatarEmoji: updatedUser.avatarEmoji,
+        statusMessage: updatedUser.statusMessage,
+        online: updatedUser.online
+      };
+      if (callback) callback({ success: true, user: formattedUser });
+    } catch (err) {
+      console.error('Update profile error:', err);
+      if (callback) callback({ success: false, error: 'Failed to update profile' });
     }
   });
 
@@ -483,6 +780,33 @@ io.on('connection', async (socket) => {
     }
   });
 });
+
+// Start Database Sweeper for Self-Destruct Messages and Expired Chat Links
+setInterval(async () => {
+  try {
+    const now = new Date();
+    
+    // Sweep expired self-destruct messages
+    const expiredMessages = await Message.find({
+      destructAt: { $lte: now }
+    });
+
+    for (const msg of expiredMessages) {
+      await Message.deleteOne({ _id: msg._id });
+      
+      // Emit real-time removal events to active rooms
+      io.to(msg.sender.toString()).emit('message_destructed', { messageId: msg._id });
+      io.to(msg.recipient.toString()).emit('message_destructed', { messageId: msg._id });
+    }
+
+    // Sweep expired chat links
+    await ChatLink.deleteMany({
+      expiresAt: { $lte: now }
+    });
+  } catch (err) {
+    console.error('Sweeper execution error:', err);
+  }
+}, 3000);
 
 // Serve static assets in production
 const clientDistPath = path.join(__dirname, '../client/dist');

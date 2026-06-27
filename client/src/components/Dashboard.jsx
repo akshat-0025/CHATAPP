@@ -2,10 +2,11 @@ import { useState, useEffect, useRef } from 'react';
 import { 
   Send, Search, LogOut, MessageSquare, Check, CheckCheck, 
   Info, X, ChevronRight, User, CircleDot, AlertCircle, ChevronLeft,
-  Plus
+  Plus, Lock, Settings, Link, Copy, Edit3, Trash2, Smile, Clock, Sparkles
 } from 'lucide-react';
+import { deriveKey, encryptMessage, decryptMessage } from '../utils/crypto';
 
-export default function Dashboard({ socket, user, token, onLogout }) {
+export default function Dashboard({ socket, user, token, onLogout, onUpdateUser }) {
   const [contacts, setContacts] = useState([]);
   const [activeContactId, setActiveContactId] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -15,6 +16,38 @@ export default function Dashboard({ socket, user, token, onLogout }) {
   const [typingStates, setTypingStates] = useState({}); // userId -> boolean
   const [connected, setConnected] = useState(socket ? socket.connected : false);
   const [apiError, setApiError] = useState('');
+
+  // E2EE and Phase 1 Upgrades States
+  const [activeChatKey, setActiveChatKey] = useState(null);
+  const [selfDestructType, setSelfDestructType] = useState('forever');
+  const [currentTime, setCurrentTime] = useState(new Date());
+  const [toastMessage, setToastMessage] = useState('');
+  
+  // Chat Invite Link States
+  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [inviteExpiresType, setInviteExpiresType] = useState('24h');
+  const [generatedInviteLink, setGeneratedInviteLink] = useState('');
+  const [inviteLoading, setInviteLoading] = useState(false);
+
+  // Reset generated link when expiration choice changes in the invite modal
+  useEffect(() => {
+    setGeneratedInviteLink('');
+  }, [inviteExpiresType]);
+
+  // Profile Settings States
+  const [showProfileModal, setShowProfileModal] = useState(false);
+  const [profileStatus, setProfileStatus] = useState(user.statusMessage || 'Available');
+  const [profileEmoji, setProfileEmoji] = useState(user.avatarEmoji || '💬');
+  const [profileColor, setProfileColor] = useState(user.avatarColor || 'from-purple-500 to-indigo-500');
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState('');
+
+  // Editing and Searching States
+  const [editingMessageId, setEditingMessageId] = useState(null);
+  const [editingText, setEditingText] = useState('');
+  const [chatSearchQuery, setChatSearchQuery] = useState('');
+  const [showSearchInput, setShowSearchInput] = useState(false);
+  const [activeMobileMessageId, setActiveMobileMessageId] = useState(null);
 
   // Start New Chat Modal States
   const [showNewChatModal, setShowNewChatModal] = useState(false);
@@ -26,8 +59,44 @@ export default function Dashboard({ socket, user, token, onLogout }) {
   const typingTimeoutRef = useRef(null);
 
   const activeContact = contacts.find(c => c.id === activeContactId);
+  const userId = user.id || user._id;
 
-  // Fetch contacts list on load
+  // E2EE helper to decrypt a list of messages
+  const decryptMessagesList = async (list, key) => {
+    if (!key) return list;
+    return Promise.all(list.map(async (msg) => {
+      try {
+        if (msg.text.startsWith('E2EE:')) {
+          const decrypted = await decryptMessage(msg.text, key);
+          return { ...msg, text: decrypted };
+        }
+      } catch (err) {
+        console.error('Error decrypting message:', err);
+      }
+      return msg;
+    }));
+  };
+
+  // E2EE helper to decrypt last message excerpts in sidebar
+  const decryptContactsList = async (contactsList) => {
+    return Promise.all(contactsList.map(async (c) => {
+      if (c.lastMessage && c.lastMessage.text.startsWith('E2EE:')) {
+        try {
+          const key = await deriveKey(userId, c.id);
+          const decryptedText = await decryptMessage(c.lastMessage.text, key);
+          return {
+            ...c,
+            lastMessage: { ...c.lastMessage, text: decryptedText }
+          };
+        } catch (err) {
+          console.error(`Failed to decrypt sidebar excerpt for ${c.username}:`, err);
+        }
+      }
+      return c;
+    }));
+  };
+
+  // Fetch contacts list (runs once or on token change)
   const fetchContacts = async () => {
     try {
       const response = await fetch('/api/users', {
@@ -37,7 +106,8 @@ export default function Dashboard({ socket, user, token, onLogout }) {
       });
       if (!response.ok) throw new Error('Failed to fetch contacts');
       const data = await response.json();
-      setContacts(data);
+      const decrypted = await decryptContactsList(data);
+      setContacts(decrypted);
     } catch (err) {
       console.error(err);
       setApiError('Error loading contact list.');
@@ -45,7 +115,7 @@ export default function Dashboard({ socket, user, token, onLogout }) {
   };
 
   // Fetch chat history with active contact
-  const fetchMessages = async (contactId) => {
+  const fetchMessages = async (contactId, key) => {
     try {
       const response = await fetch(`/api/messages/${contactId}`, {
         headers: {
@@ -54,7 +124,8 @@ export default function Dashboard({ socket, user, token, onLogout }) {
       });
       if (!response.ok) throw new Error('Failed to fetch messages');
       const data = await response.json();
-      setMessages(data);
+      const decrypted = await decryptMessagesList(data, key);
+      setMessages(decrypted);
       
       // Auto-scroll to bottom after content loads
       setTimeout(scrollToBottom, 50);
@@ -64,10 +135,95 @@ export default function Dashboard({ socket, user, token, onLogout }) {
     }
   };
 
+  // Initial load
   useEffect(() => {
     fetchContacts();
+  }, [token]);
 
-    // Setup socket state monitoring
+  // Keep countdown times fresh
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(new Date());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Toast auto-clear
+  useEffect(() => {
+    if (toastMessage) {
+      const t = setTimeout(() => setToastMessage(''), 3000);
+      return () => clearTimeout(t);
+    }
+  }, [toastMessage]);
+
+  // Check for invite links to accept
+  useEffect(() => {
+    const inviteCode = localStorage.getItem('pending_invite_code');
+    if (inviteCode && token) {
+      localStorage.removeItem('pending_invite_code');
+      
+      fetch(`/api/chat-links/${inviteCode}/accept`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      })
+        .then(async (res) => {
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.message || 'Failed to accept invite');
+          
+          setContacts(prev => {
+            const exists = prev.some(c => c.id === data.creator.id);
+            if (exists) return prev;
+            return [data.creator, ...prev];
+          });
+          setActiveContactId(data.creator.id);
+          setToastMessage(`Securely connected with ${data.creator.username}!`);
+        })
+        .catch(err => {
+          console.error('Accept invite link error:', err);
+          setApiError(err.message || 'Failed to establish connection via invite link.');
+        });
+    }
+  }, [token]);
+
+  // Derive E2EE Key when Active Contact Changes
+  useEffect(() => {
+    if (activeContactId && userId) {
+      setActiveChatKey(null);
+      deriveKey(userId, activeContactId)
+        .then(key => {
+          setActiveChatKey(key);
+        })
+        .catch(err => {
+          console.error('E2EE key derivation failed:', err);
+          setApiError('Failed to establish E2EE channel.');
+        });
+    } else {
+      setActiveChatKey(null);
+    }
+  }, [activeContactId, userId]);
+
+  // Load chat messages when Contact and Key are established
+  useEffect(() => {
+    if (activeContactId && activeChatKey) {
+      fetchMessages(activeContactId, activeChatKey);
+      
+      // Mark read receipts
+      socket.emit('read_receipt', { senderId: activeContactId });
+
+      // Reset sidebar unread badge
+      setContacts(prev => prev.map(c => {
+        if (c.id === activeContactId) {
+          return { ...c, unreadCount: 0 };
+        }
+        return c;
+      }));
+    }
+  }, [activeContactId, activeChatKey]);
+
+  // Socket.IO event subscribers
+  useEffect(() => {
     if (socket) {
       setConnected(socket.connected);
       
@@ -77,11 +233,21 @@ export default function Dashboard({ socket, user, token, onLogout }) {
       socket.on('connect', onConnect);
       socket.on('disconnect', onDisconnect);
 
-      // Handle real-time user status changes
-      socket.on('user_status', ({ userId, online, lastSeen }) => {
+      // Handle user online/offline status changes
+      socket.on('user_status', ({ userId: statusUserId, online, lastSeen }) => {
         setContacts(prev => prev.map(c => {
-          if (c.id === userId) {
+          if (c.id === statusUserId) {
             return { ...c, online, lastSeen: lastSeen || c.lastSeen };
+          }
+          return c;
+        }));
+      });
+
+      // Handle real-time profile updates
+      socket.on('user_profile_updated', ({ userId: profileUserId, avatarEmoji, avatarColor, statusMessage }) => {
+        setContacts(prev => prev.map(c => {
+          if (c.id === profileUserId) {
+            return { ...c, avatarEmoji, avatarColor, statusMessage };
           }
           return c;
         }));
@@ -89,45 +255,65 @@ export default function Dashboard({ socket, user, token, onLogout }) {
 
       // Handle real-time incoming messages
       socket.on('private_message', (message) => {
-        // If the message belongs to the current chat
         const isCurrentChat = 
           (message.sender === userId && message.recipient === activeContactId) || 
           (message.sender === activeContactId && message.recipient === userId);
 
-        if (isCurrentChat) {
-          setMessages(prev => [...prev, message]);
-          setTimeout(scrollToBottom, 50);
-
-          // If the message is incoming, mark it as read immediately
-          if (message.sender === activeContactId) {
-            socket.emit('read_receipt', { senderId: activeContactId });
-          }
-        }
-
-        // Update contacts last message excerpt and unread count in sidebar
-        setContacts(prev => prev.map(c => {
-          const isSender = c.id === message.sender;
-          const isRecipient = c.id === message.recipient;
-          
-          if (isSender || isRecipient) {
-            const isPeer = isSender ? message.sender : message.recipient;
-            const updatedUnread = (isSender && !isCurrentChat) ? (c.unreadCount + 1) : c.unreadCount;
+        // Process message decrypt asynchronously
+        const processIncomingMessage = async () => {
+          try {
+            let decryptedText = message.text;
             
-            return {
-              ...c,
-              lastMessage: {
-                text: message.text,
-                sender: message.sender,
-                createdAt: message.createdAt
-              },
-              unreadCount: updatedUnread
-            };
+            if (message.text.startsWith('E2EE:')) {
+              const partnerId = message.sender === userId ? message.recipient : message.sender;
+              const key = (isCurrentChat && activeChatKey) ? activeChatKey : await deriveKey(userId, partnerId);
+              decryptedText = await decryptMessage(message.text, key);
+            }
+
+            const decryptedMessage = { ...message, text: decryptedText };
+
+            if (isCurrentChat) {
+              setMessages(prev => [...prev, decryptedMessage]);
+              setTimeout(scrollToBottom, 50);
+
+              if (message.sender === activeContactId) {
+                socket.emit('read_receipt', { senderId: activeContactId });
+              }
+            }
+
+            // Update sidebar contact snippet
+            setContacts(prev => prev.map(c => {
+              const isSender = c.id === message.sender;
+              const isRecipient = c.id === message.recipient;
+              
+              if (isSender || isRecipient) {
+                const updatedUnread = (isSender && !isCurrentChat) ? (c.unreadCount + 1) : c.unreadCount;
+                return {
+                  ...c,
+                  lastMessage: {
+                    text: decryptedText,
+                    sender: message.sender,
+                    createdAt: message.createdAt
+                  },
+                  unreadCount: updatedUnread
+                };
+              }
+              return c;
+            }));
+          } catch (err) {
+            console.error('Error handling incoming private_message:', err);
+            // Safe fallback: append message as-is to ensure real-time updates don't stall
+            if (isCurrentChat) {
+              setMessages(prev => [...prev, message]);
+              setTimeout(scrollToBottom, 50);
+            }
           }
-          return c;
-        }));
+        };
+
+        processIncomingMessage();
       });
 
-      // Handle real-time typing indicators
+      // Handle typing status
       socket.on('typing', ({ senderId, isTyping }) => {
         setTypingStates(prev => ({
           ...prev,
@@ -135,7 +321,7 @@ export default function Dashboard({ socket, user, token, onLogout }) {
         }));
       });
 
-      // Handle real-time read receipts updates
+      // Handle message read receipts
       socket.on('messages_read', ({ readerId }) => {
         if (readerId === activeContactId) {
           setMessages(prev => prev.map(m => {
@@ -147,33 +333,102 @@ export default function Dashboard({ socket, user, token, onLogout }) {
         }
       });
 
+      // Handle message editing
+      socket.on('message_edited', ({ messageId, text, isEdited }) => {
+        const decryptAndEdit = async () => {
+          let displayText = text;
+          if (text.startsWith('E2EE:') && activeChatKey) {
+            displayText = await decryptMessage(text, activeChatKey);
+          }
+          
+          setMessages(prev => prev.map(m => {
+            if (m._id === messageId) {
+              return { ...m, text: displayText, isEdited };
+            }
+            return m;
+          }));
+        };
+        decryptAndEdit();
+      });
+
+      // Handle message deletion
+      socket.on('message_deleted', ({ messageId, text, isDeleted }) => {
+        setMessages(prev => prev.map(m => {
+          if (m._id === messageId) {
+            return { ...m, text, isDeleted, isEdited: false };
+          }
+          return m;
+        }));
+      });
+
+      // Handle message reactions
+      socket.on('message_reacted', ({ messageId, reactions }) => {
+        setMessages(prev => prev.map(m => {
+          if (m._id === messageId) {
+            return { ...m, reactions };
+          }
+          return m;
+        }));
+      });
+
+      // Handle self-destruct countdown initialization (Disappearing Messages)
+      socket.on('message_destruct_timer_started', ({ messageId, destructAt }) => {
+        setMessages(prev => prev.map(m => {
+          if (m._id === messageId) {
+            return { ...m, destructAt };
+          }
+          return m;
+        }));
+      });
+
+      // Handle real-time self-destruct deletion
+      socket.on('message_destructed', ({ messageId }) => {
+        setMessages(prev => prev.map(m => {
+          if (m._id === messageId) {
+            return { ...m, isDestructing: true };
+          }
+          return m;
+        }));
+        
+        // Let the fade-out animation play before filtering it out from state
+        setTimeout(() => {
+          setMessages(prev => prev.filter(m => m._id !== messageId));
+        }, 500);
+      });
+
       return () => {
         socket.off('connect', onConnect);
         socket.off('disconnect', onDisconnect);
         socket.off('user_status');
+        socket.off('user_profile_updated');
         socket.off('private_message');
         socket.off('typing');
         socket.off('messages_read');
+        socket.off('message_edited');
+        socket.off('message_deleted');
+        socket.off('message_reacted');
+        socket.off('message_destruct_timer_started');
+        socket.off('message_destructed');
       };
     }
-  }, [socket, activeContactId]);
+  }, [socket, activeContactId, activeChatKey]);
 
-  // Load messages when the active contact changes
+  // Handle browser popstate to allow mobile hardware back button to close active chat
   useEffect(() => {
     if (activeContactId) {
-      fetchMessages(activeContactId);
-      
-      // Mark read receipts for new active chat messages
-      socket.emit('read_receipt', { senderId: activeContactId });
-
-      // Reset sidebar unread badge
-      setContacts(prev => prev.map(c => {
-        if (c.id === activeContactId) {
-          return { ...c, unreadCount: 0 };
-        }
-        return c;
-      }));
+      window.history.pushState({ hasChat: true }, '');
     }
+
+    const handlePopState = (e) => {
+      if (activeContactId) {
+        setActiveContactId(null);
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
+    };
   }, [activeContactId]);
 
   const scrollToBottom = () => {
@@ -182,16 +437,18 @@ export default function Dashboard({ socket, user, token, onLogout }) {
     }
   };
 
-  const userId = user.id;
-
-  const handleSendMessage = (e) => {
+  const handleSendMessage = async (e) => {
     if (e) e.preventDefault();
-    if (!inputText.trim() || !activeContactId) return;
+    if (!inputText.trim() || !activeContactId || !activeChatKey) return;
+
+    const plaintext = inputText.trim();
+    const encryptedText = await encryptMessage(plaintext, activeChatKey);
 
     // Send private message over Socket.io
     socket.emit('private_message', {
       recipientId: activeContactId,
-      text: inputText.trim()
+      text: encryptedText,
+      selfDestructType: selfDestructType
     }, (response) => {
       if (response && !response.success) {
         setApiError(response.error || 'Failed to send message.');
@@ -270,6 +527,114 @@ export default function Dashboard({ socket, user, token, onLogout }) {
     }
   };
 
+  // Generate a Shareable Chat Link
+  const handleCreateInviteLink = async (e) => {
+    if (e) e.preventDefault();
+    setInviteLoading(true);
+    setGeneratedInviteLink('');
+    try {
+      const res = await fetch('/api/chat-links', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ expiresType: inviteExpiresType })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || 'Failed to create invite link');
+
+      const link = `${window.location.origin}/connect/${data.code}`;
+      setGeneratedInviteLink(link);
+    } catch (err) {
+      console.error(err);
+      setApiError(err.message || 'Failed to create chat link');
+    } finally {
+      setInviteLoading(false);
+    }
+  };
+
+  // Save updated Profile Settings (Anonymous Profiles)
+  const handleSaveProfile = (e) => {
+    if (e) e.preventDefault();
+    setProfileLoading(true);
+    setProfileError('');
+
+    socket.emit('update_profile', {
+      avatarEmoji: profileEmoji,
+      avatarColor: profileColor,
+      statusMessage: profileStatus
+    }, (response) => {
+      setProfileLoading(false);
+      if (response && response.success) {
+        if (onUpdateUser) onUpdateUser(response.user);
+        setShowProfileModal(false);
+        setToastMessage('Profile settings saved!');
+      } else {
+        setProfileError(response?.error || 'Failed to save profile settings');
+      }
+    });
+  };
+
+  // Save edited message text
+  const handleSaveEdit = async (messageId) => {
+    if (!editingText.trim() || !activeChatKey) return;
+    
+    const encrypted = await encryptMessage(editingText.trim(), activeChatKey);
+    
+    socket.emit('edit_message', { messageId, text: encrypted }, (response) => {
+      if (response && response.success) {
+        setEditingMessageId(null);
+        setEditingText('');
+      } else {
+        setApiError(response?.error || 'Failed to save edit.');
+      }
+    });
+  };
+
+  const handleMessageClick = (msgId) => {
+    setActiveMobileMessageId(prev => prev === msgId ? null : msgId);
+  };
+
+  // Secure context and insecure context copy-to-clipboard wrapper
+  const copyToClipboard = (text) => {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text)
+        .then(() => {
+          setToastMessage('Link copied to clipboard!');
+        })
+        .catch((err) => {
+          console.error('navigator.clipboard failed, using fallback:', err);
+          fallbackCopyText(text);
+        });
+    } else {
+      fallbackCopyText(text);
+    }
+  };
+
+  const fallbackCopyText = (text) => {
+    try {
+      const textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.style.position = 'fixed'; // Avoid scrolling
+      textArea.style.top = '0';
+      textArea.style.left = '0';
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      const successful = document.execCommand('copy');
+      document.body.removeChild(textArea);
+      if (successful) {
+        setToastMessage('Link copied to clipboard!');
+      } else {
+        throw new Error('Copy failed');
+      }
+    } catch (err) {
+      console.error('Fallback copy error:', err);
+      setApiError('Failed to copy. Please manually copy the link.');
+    }
+  };
+
   // Group messages list by Date (Today, Yesterday, DateString)
   const groupMessagesByDate = (messagesList) => {
     const groups = [];
@@ -324,6 +689,26 @@ export default function Dashboard({ socket, user, token, onLogout }) {
     c.username.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
+  // Filters messages list by search query
+  const filteredMessages = messages.filter(m => 
+    !chatSearchQuery || m.text.toLowerCase().includes(chatSearchQuery.toLowerCase())
+  );
+
+  // Helper to format remaining self-destruct time
+  const getCountdownLabel = (destructAtStr) => {
+    const diffMs = new Date(destructAtStr) - currentTime;
+    if (diffMs <= 0) return 'Deleting...';
+    
+    const diffSecs = Math.floor(diffMs / 1000);
+    if (diffSecs < 60) return `${diffSecs}s`;
+    
+    const diffMins = Math.floor(diffSecs / 60);
+    if (diffMins < 60) return `${diffMins}m`;
+    
+    const diffHours = Math.floor(diffMins / 60);
+    return `${diffHours}h`;
+  };
+
   return (
     <div className="flex h-dvh bg-dark-950 text-gray-200 overflow-hidden font-sans relative">
       {/* Background glow effects */}
@@ -355,6 +740,33 @@ export default function Dashboard({ socket, user, token, onLogout }) {
             </div>
 
             <div className="flex items-center gap-1">
+              {/* Private Invite Link Action */}
+              <button
+                onClick={() => {
+                  setGeneratedInviteLink('');
+                  setShowInviteModal(true);
+                }}
+                title="Create Private Link"
+                className="p-2.5 rounded-xl text-dark-400 hover:text-white hover:bg-white/5 transition-all duration-200 cursor-pointer"
+              >
+                <Link className="w-4.5 h-4.5" />
+              </button>
+
+              {/* Profile Settings Action */}
+              <button
+                onClick={() => {
+                  setProfileEmoji(user.avatarEmoji || '💬');
+                  setProfileColor(user.avatarColor || 'from-purple-500 to-indigo-500');
+                  setProfileStatus(user.statusMessage || 'Available');
+                  setProfileError('');
+                  setShowProfileModal(true);
+                }}
+                title="Profile Settings"
+                className="p-2.5 rounded-xl text-dark-400 hover:text-white hover:bg-white/5 transition-all duration-200 cursor-pointer"
+              >
+                <Settings className="w-4.5 h-4.5" />
+              </button>
+
               {/* New Chat Action */}
               <button
                 onClick={() => setShowNewChatModal(true)}
@@ -494,8 +906,14 @@ export default function Dashboard({ socket, user, token, onLogout }) {
                 <div className="flex items-center gap-3 min-w-0">
                   {/* Back button on mobile */}
                   <button
-                    onClick={() => setActiveContactId(null)}
-                    className="md:hidden mr-1 p-2 rounded-xl text-dark-400 hover:text-white hover:bg-white/5 transition-all duration-200 cursor-pointer"
+                    onClick={() => {
+                      if (window.history.state && window.history.state.hasChat) {
+                        window.history.back();
+                      } else {
+                        setActiveContactId(null);
+                      }
+                    }}
+                    className="mr-1 p-2 rounded-xl text-dark-400 hover:text-white hover:bg-white/5 transition-all duration-200 cursor-pointer"
                   >
                     <ChevronLeft className="w-5 h-5" />
                   </button>
@@ -504,12 +922,23 @@ export default function Dashboard({ socket, user, token, onLogout }) {
                     {activeContact.avatarEmoji}
                   </div>
                   <div className="flex flex-col min-w-0">
-                    <span className="font-semibold text-white truncate text-sm">{activeContact.username}</span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-semibold text-white truncate text-sm">{activeContact.username}</span>
+                      <div 
+                        title="End-to-End Encrypted: Messages are encrypted locally and only readable by you and your recipient."
+                        className="group relative flex items-center"
+                      >
+                        <Lock className="w-3.5 h-3.5 text-accent-teal shrink-0 cursor-help" />
+                        <span className="absolute bottom-[-32px] left-1/2 -translate-x-1/2 w-48 text-center p-1.5 text-[9px] bg-dark-900 border border-white/5 text-dark-300 rounded-lg shadow-xl opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none select-none z-55 backdrop-blur-md">
+                          End-to-End Encrypted
+                        </span>
+                      </div>
+                    </div>
                     <span className="text-xs text-dark-400 truncate">
                       {typingStates[activeContact.id] ? (
                         <span className="text-brand-400 font-medium animate-pulse">typing...</span>
                       ) : activeContact.online ? (
-                        <span className="text-accent-teal font-medium">Online</span>
+                        <span className="text-accent-teal font-medium">Online {activeContact.statusMessage && `• "${activeContact.statusMessage}"`}</span>
                       ) : (
                         <span>Offline • last seen {formatLastSeen(activeContact.lastSeen)}</span>
                       )}
@@ -518,14 +947,43 @@ export default function Dashboard({ socket, user, token, onLogout }) {
                 </div>
 
                 {/* Right controls */}
-                <button
-                  onClick={() => setShowDetailPanel(!showDetailPanel)}
-                  className={`p-2 rounded-xl transition-all duration-200 cursor-pointer ${
-                    showDetailPanel ? 'text-brand-400 bg-brand-500/10' : 'text-dark-400 hover:text-white hover:bg-white/5'
-                  }`}
-                >
-                  <Info className="w-5 h-5" />
-                </button>
+                <div className="flex items-center gap-1.5">
+                  {/* Search toggle */}
+                  <div className="relative flex items-center">
+                    {showSearchInput && (
+                      <input
+                        type="text"
+                        placeholder="Search messages..."
+                        value={chatSearchQuery}
+                        onChange={(e) => setChatSearchQuery(e.target.value)}
+                        className="px-3 py-1.5 text-xs rounded-xl glass-input placeholder-dark-500 text-white w-40 md:w-56 mr-2 animate-fade-in"
+                        autoFocus
+                      />
+                    )}
+                    <button
+                      onClick={() => {
+                        setShowSearchInput(!showSearchInput);
+                        if (showSearchInput) setChatSearchQuery('');
+                      }}
+                      title="Search Messages"
+                      className={`p-2 rounded-xl transition-all duration-200 cursor-pointer ${
+                        showSearchInput ? 'text-brand-400 bg-brand-500/10' : 'text-dark-400 hover:text-white hover:bg-white/5'
+                      }`}
+                    >
+                      <Search className="w-5 h-5" />
+                    </button>
+                  </div>
+
+                  <button
+                    onClick={() => setShowDetailPanel(!showDetailPanel)}
+                    title="Conversation Details"
+                    className={`p-2 rounded-xl transition-all duration-200 cursor-pointer ${
+                      showDetailPanel ? 'text-brand-400 bg-brand-500/10' : 'text-dark-400 hover:text-white hover:bg-white/5'
+                    }`}
+                  >
+                    <Info className="w-5 h-5" />
+                  </button>
+                </div>
               </header>
 
               {/* Message Feed Container */}
@@ -539,11 +997,11 @@ export default function Dashboard({ socket, user, token, onLogout }) {
                     <p className="text-xs mt-1 max-w-[280px]">All messages in this session are encrypted and private.</p>
                   </div>
                 ) : (
-                  groupMessagesByDate(messages).map((item, idx) => {
+                  groupMessagesByDate(filteredMessages).map((item, idx) => {
                     if (item.type === 'date') {
                       return (
                         <div key={`date-${idx}`} className="flex justify-center my-6">
-                          <span className="px-3 py-1 text-[11px] font-semibold text-dark-400 bg-white/5 rounded-full uppercase tracking-wider backdrop-blur-sm border border-white/[0.02]">
+                           <span className="px-3 py-1 text-[11px] font-semibold text-dark-400 bg-white/5 rounded-full uppercase tracking-wider backdrop-blur-sm border border-white/[0.02]">
                             {item.label}
                           </span>
                         </div>
@@ -552,25 +1010,159 @@ export default function Dashboard({ socket, user, token, onLogout }) {
 
                     const msg = item.data;
                     const isSelf = msg.sender === userId;
+                    const isEditing = msg._id === editingMessageId;
                     
                     return (
                       <div
                         key={msg._id || idx}
-                        className={`flex ${isSelf ? 'justify-end' : 'justify-start'} group`}
+                        onClick={() => handleMessageClick(msg._id)}
+                        className={`flex ${isSelf ? 'justify-end' : 'justify-start'} group transition-all duration-500 transform cursor-pointer ${
+                          msg.isDestructing ? 'opacity-0 scale-95 max-h-0 py-0 my-0 overflow-hidden' : 'opacity-100 scale-100'
+                        }`}
                       >
-                        <div className={`max-w-[85%] md:max-w-[70%] flex flex-col ${isSelf ? 'items-end' : 'items-start'}`}>
+                        <div className={`max-w-[85%] md:max-w-[70%] flex flex-col ${isSelf ? 'items-end' : 'items-start'} relative`}>
+                          
+                          {/* Hover action toolbar for reactions, edit, and delete */}
+                          {!msg.isDeleted && !isEditing && (
+                            <div className={`absolute top-[-26px] z-20 items-center gap-1.5 bg-dark-900/90 border border-white/10 rounded-full px-2 py-1 shadow-2xl backdrop-blur-md transition-all duration-200 ${
+                              isSelf ? 'right-2' : 'left-2'
+                            } ${
+                              activeMobileMessageId === msg._id ? 'flex animate-scale-in' : 'group-hover:flex hidden'
+                            }`}>
+                              {['👍', '❤️', '😂', '😮', '😢', '🔥'].map(emoji => (
+                                <button
+                                  key={emoji}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    socket.emit('react_message', { messageId: msg._id, emoji });
+                                    setActiveMobileMessageId(null); // close on react
+                                  }}
+                                  className="hover:scale-125 transition-transform duration-100 px-0.5 cursor-pointer text-xs"
+                                >
+                                  {emoji}
+                                </button>
+                              ))}
+                              {isSelf && (
+                                <>
+                                  <div className="w-[1px] h-3 bg-white/10 mx-1"></div>
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setEditingMessageId(msg._id);
+                                      setEditingText(msg.text);
+                                      setActiveMobileMessageId(null);
+                                    }}
+                                    title="Edit Message"
+                                    className="p-1 rounded text-dark-400 hover:text-white transition-colors cursor-pointer"
+                                  >
+                                    <Edit3 className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      if (confirm('Delete this message?')) {
+                                        socket.emit('delete_message', { messageId: msg._id });
+                                      }
+                                      setActiveMobileMessageId(null);
+                                    }}
+                                    title="Delete Message"
+                                    className="p-1 rounded text-dark-400 hover:text-accent-rose transition-colors cursor-pointer"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          )}
+
                           {/* Chat bubble body */}
                           <div className={`p-3 rounded-2xl text-sm relative transition-all duration-200 shadow-md ${
                             isSelf
                               ? 'bg-gradient-to-br from-brand-600 to-brand-700 text-white rounded-tr-none'
                               : 'glass-panel text-gray-200 rounded-tl-none'
                           }`}>
-                            <p className="whitespace-pre-wrap break-words leading-relaxed">{msg.text}</p>
+                            {isEditing ? (
+                              <div 
+                                onClick={(e) => e.stopPropagation()} 
+                                className="flex gap-2 items-center min-w-[200px]"
+                              >
+                                <input
+                                  type="text"
+                                  value={editingText}
+                                  onChange={(e) => setEditingText(e.target.value)}
+                                  className="flex-1 px-3 py-1 text-xs text-white rounded-lg glass-input bg-dark-950/50"
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') handleSaveEdit(msg._id);
+                                    if (e.key === 'Escape') setEditingMessageId(null);
+                                  }}
+                                  autoFocus
+                                />
+                                <button 
+                                  onClick={(e) => { e.stopPropagation(); handleSaveEdit(msg._id); }}
+                                  className="text-xs px-2 py-1 bg-brand-500 rounded-lg text-white font-semibold cursor-pointer"
+                                >
+                                  Save
+                                </button>
+                                <button 
+                                  onClick={(e) => { e.stopPropagation(); setEditingMessageId(null); }}
+                                  className="text-xs px-2 py-1 bg-white/5 rounded-lg text-dark-300 hover:text-white cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : msg.isDeleted ? (
+                              <p className="text-xs italic text-dark-500 leading-relaxed">This message was deleted</p>
+                            ) : (
+                              <>
+                                <p className="whitespace-pre-wrap break-words leading-relaxed">{msg.text}</p>
+                                
+                                {/* Inline reaction counts */}
+                                {msg.reactions && msg.reactions.length > 0 && (
+                                  <div className={`flex flex-wrap gap-1 mt-2 ${isSelf ? 'justify-end' : 'justify-start'}`}>
+                                    {Object.entries(
+                                      msg.reactions.reduce((acc, r) => {
+                                        acc[r.emoji] = acc[r.emoji] || [];
+                                        acc[r.emoji].push(r.userId);
+                                        return acc;
+                                      }, {})
+                                    ).map(([emoji, userIds]) => {
+                                      const hasReacted = userIds.includes(userId);
+                                      return (
+                                        <button
+                                          key={emoji}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            socket.emit('react_message', { messageId: msg._id, emoji });
+                                          }}
+                                          className={`flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] border transition-all duration-200 cursor-pointer ${
+                                            hasReacted
+                                              ? 'bg-brand-500/20 border-brand-500/40 text-brand-300 font-semibold'
+                                              : 'bg-white/[0.02] border-white/5 text-dark-400 hover:bg-white/5 hover:text-white'
+                                          }`}
+                                        >
+                                          <span>{emoji}</span>
+                                          <span>{userIds.length}</span>
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </>
+                            )}
                           </div>
 
                           {/* Message meta & receipt status */}
                           <div className="flex items-center gap-1.5 mt-1.5 px-1 text-[10px] text-dark-500">
                             <span>{formatTime(msg.createdAt)}</span>
+                            {msg.isEdited && <span className="text-[9px] text-dark-500 italic">(edited)</span>}
+                            
+                            {msg.destructAt && (
+                              <span className="text-[10px] text-accent-rose flex items-center gap-1 font-semibold">
+                                <Clock className="w-3 h-3 animate-pulse text-accent-rose" />
+                                <span>{getCountdownLabel(msg.destructAt)}</span>
+                              </span>
+                            )}
+
                             {isSelf && (
                               msg.read ? (
                                 <CheckCheck className="w-3.5 h-3.5 text-accent-blue" />
@@ -601,7 +1193,18 @@ export default function Dashboard({ socket, user, token, onLogout }) {
 
               {/* Chat Input Footer */}
               <footer className="p-3 border-t border-white/5 bg-dark-950/20 shrink-0">
-                <form onSubmit={handleSendMessage} className="flex gap-2">
+                <form onSubmit={handleSendMessage} className="flex gap-2 items-center">
+                  <select
+                    value={selfDestructType}
+                    onChange={(e) => setSelfDestructType(e.target.value)}
+                    title="Self-Destruct Duration"
+                    className="px-2 py-3 rounded-xl text-xs glass-input text-dark-300 font-medium cursor-pointer max-w-[80px] md:max-w-[125px] bg-dark-950 focus:border-brand-500/50"
+                  >
+                    <option value="forever">♾️ Forever</option>
+                    <option value="after_read">⏱️ Read</option>
+                    <option value="1h">🕒 1h</option>
+                    <option value="24h">🕒 24h</option>
+                  </select>
                   <input
                     type="text"
                     placeholder={`Type a message to ${activeContact.username}...`}
@@ -786,6 +1389,236 @@ export default function Dashboard({ socket, user, token, onLogout }) {
                   className="px-4 py-2 text-xs font-semibold rounded-xl bg-gradient-to-r from-brand-600 to-brand-500 text-white shadow-md hover:from-brand-500 hover:to-brand-600 transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {newChatLoading ? 'Searching...' : 'Start Chat'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Toast Notification Banner */}
+      {toastMessage && (
+        <div className="fixed bottom-6 right-6 z-[120] bg-dark-900 border border-brand-500/30 text-brand-400 px-4 py-3 rounded-xl shadow-2xl flex items-center gap-2 animate-fade-in backdrop-blur-md">
+          <Sparkles className="w-4.5 h-4.5 text-brand-400" />
+          <span className="text-sm font-semibold">{toastMessage}</span>
+        </div>
+      )}
+
+      {/* Create Invite Link Modal */}
+      {showInviteModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in animate-duration-200">
+          <div className="w-full max-w-md glass-card rounded-2xl shadow-2xl p-6 relative overflow-hidden border border-white/5">
+            <div className="absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r from-brand-500 to-accent-blue"></div>
+            
+            <div className="flex justify-between items-start mb-4">
+              <div>
+                <h3 className="text-lg font-bold text-white">Create Private Link</h3>
+                <p className="text-xs text-dark-400 mt-1">
+                  Generate a temporary secure invite link to instantly connect with someone.
+                </p>
+              </div>
+              <button
+                onClick={() => setShowInviteModal(false)}
+                className="p-1 rounded-lg text-dark-400 hover:text-white hover:bg-white/5 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <label className="block text-xs font-semibold text-dark-300 uppercase tracking-wider">
+                  Link Expiration
+                </label>
+                <div className="grid grid-cols-4 gap-2">
+                  {[
+                    { type: '1h', label: '1 Hour' },
+                    { type: '24h', label: '24 Hours' },
+                    { type: '7d', label: '7 Days' },
+                    { type: 'never', label: 'Never' }
+                  ].map(opt => (
+                    <button
+                      key={opt.type}
+                      type="button"
+                      onClick={() => setInviteExpiresType(opt.type)}
+                      className={`px-2 py-2 text-xs font-semibold rounded-xl border transition-all duration-200 cursor-pointer ${
+                        inviteExpiresType === opt.type
+                          ? 'bg-brand-600/15 border-brand-500 text-brand-400'
+                          : 'bg-white/[0.02] border-white/5 text-dark-400 hover:bg-white/5'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {generatedInviteLink ? (
+                <div className="space-y-3 pt-2">
+                  <div className="relative">
+                    <input
+                      type="text"
+                      readOnly
+                      value={generatedInviteLink}
+                      className="w-full pl-3 pr-12 py-3 rounded-xl text-white text-xs glass-input select-all font-mono"
+                    />
+                    <button
+                      onClick={() => copyToClipboard(generatedInviteLink)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 bg-brand-600 hover:bg-brand-500 rounded-lg text-white transition-all cursor-pointer"
+                      title="Copy Link"
+                    >
+                      <Copy className="w-4.5 h-4.5" />
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-accent-teal text-center font-medium">
+                    ✔ Copy and share this link. Anyone opening it will instantly open a chat with you!
+                  </p>
+                </div>
+              ) : (
+                <div className="pt-2">
+                  <button
+                    onClick={handleCreateInviteLink}
+                    disabled={inviteLoading}
+                    className="w-full py-3 rounded-xl bg-gradient-to-r from-brand-600 to-brand-500 text-white font-semibold shadow-md hover:from-brand-500 hover:to-brand-600 transition-all duration-200 cursor-pointer disabled:opacity-50"
+                  >
+                    {inviteLoading ? 'Generating...' : 'Generate Invite Link'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Profile Settings Modal */}
+      {showProfileModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in animate-duration-200">
+          <div className="w-full max-w-lg glass-card rounded-2xl shadow-2xl p-6 relative overflow-hidden border border-white/5 flex flex-col max-h-[85vh]">
+            <div className="absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r from-brand-500 to-accent-blue"></div>
+            
+            <div className="flex justify-between items-start mb-4 shrink-0">
+              <div>
+                <h3 className="text-lg font-bold text-white">Profile Settings</h3>
+                <p className="text-xs text-dark-400 mt-1">
+                  Customize your anonymous representation. Privacy remains username-only.
+                </p>
+              </div>
+              <button
+                onClick={() => setShowProfileModal(false)}
+                className="p-1 rounded-lg text-dark-400 hover:text-white hover:bg-white/5 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {profileError && (
+              <div className="p-3 bg-accent-rose/10 border border-accent-rose/20 text-accent-rose text-xs rounded-xl mb-4 shrink-0">
+                {profileError}
+              </div>
+            )}
+
+            <form onSubmit={handleSaveProfile} className="space-y-4 overflow-y-auto pr-1 flex-1">
+              {/* Profile Preview Card */}
+              <div className="p-4 bg-white/[0.02] border border-white/5 rounded-2xl flex items-center gap-4 shrink-0 justify-center">
+                <div className={`w-16 h-16 rounded-2xl bg-gradient-to-br ${profileColor} flex items-center justify-center text-3xl shadow-lg`}>
+                  {profileEmoji}
+                </div>
+                <div className="flex flex-col">
+                  <span className="font-semibold text-white text-sm">Preview ({user.username})</span>
+                  <span className="text-xs text-dark-400 mt-0.5">Status: "{profileStatus}"</span>
+                </div>
+              </div>
+
+              {/* Status Input */}
+              <div className="space-y-2 shrink-0">
+                <label className="block text-xs font-semibold text-dark-300 uppercase tracking-wider">
+                  Status Message
+                </label>
+                <input
+                  type="text"
+                  maxLength={50}
+                  placeholder="e.g. Coding MERN 🚀"
+                  value={profileStatus}
+                  onChange={(e) => setProfileStatus(e.target.value)}
+                  className="w-full px-4 py-2.5 rounded-xl text-white placeholder-dark-500 text-sm glass-input"
+                />
+              </div>
+
+              {/* Gradient Color Selection */}
+              <div className="space-y-2 shrink-0">
+                <label className="block text-xs font-semibold text-dark-300 uppercase tracking-wider">
+                  Avatar Background Gradient
+                </label>
+                <div className="flex flex-wrap gap-2 justify-center">
+                  {[
+                    'from-pink-500 to-rose-500',
+                    'from-purple-500 to-indigo-500',
+                    'from-blue-500 to-cyan-500',
+                    'from-emerald-500 to-teal-500',
+                    'from-amber-500 to-orange-500',
+                    'from-red-500 to-orange-600',
+                    'from-violet-600 to-fuchsia-600',
+                    'from-lime-500 to-emerald-600',
+                    'from-cyan-500 to-blue-500',
+                    'from-rose-500 to-orange-500',
+                    'from-yellow-400 to-orange-500',
+                    'from-indigo-500 to-purple-600'
+                  ].map(color => (
+                    <button
+                      key={color}
+                      type="button"
+                      onClick={() => setProfileColor(color)}
+                      className={`w-8 h-8 rounded-lg bg-gradient-to-br ${color} transition-all duration-200 cursor-pointer ${
+                        profileColor === color ? 'scale-110 ring-2 ring-brand-500 ring-offset-2 ring-offset-dark-950' : 'hover:scale-105'
+                      }`}
+                    />
+                  ))}
+                </div>
+              </div>
+
+              {/* Emoji Selection Grid */}
+              <div className="space-y-2 flex-1 flex flex-col min-h-0">
+                <label className="block text-xs font-semibold text-dark-300 uppercase tracking-wider shrink-0">
+                  Select Avatar Emoji
+                </label>
+                <div className="grid grid-cols-6 sm:grid-cols-8 gap-1.5 overflow-y-auto p-2 bg-dark-950/40 rounded-2xl border border-white/5 max-h-[160px]">
+                  {[
+                    '🐱', '🦊', '🐨', '🦁', '🐯', '🐼', '🐸', '🐙', '🦄', '🦖', '🦉', '👾', '🚀', '⭐', '🌈', '👻',
+                    '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '😊', '😇', '🙂', '🙃', '😉', '😌', '😍', '🥰',
+                    '😘', '😗', '😙', '😚', '😋', '😛', '😝', '😜', '🤪', '🤨', '🧐', '😎', '🥸', '🤩', '🥳', '🥶',
+                    '😏', '😒', '😞', '😔', '😟', '😕', '🙁', '☹️', '😣', '😖', '😫', '😩', '🥺', '😢', '😭', '😤',
+                    '😠', '😡', '🤬', '🤯', '😳', '🥵', '🥶', '😱', '😨', '😰', '😥', '🤗', '🤔', '🫣', '🤭', '😴',
+                    '🐶', '🐰', '🦁', '🐮', '🐵', '🐔', '🐧', '🦅', '🦉', '🦇', '🐝', '🦋', '💻', '🖥️', '🎮', '💡'
+                  ].map(emoji => (
+                    <button
+                      key={emoji}
+                      type="button"
+                      onClick={() => setProfileEmoji(emoji)}
+                      className={`h-9 text-xl rounded-xl flex items-center justify-center transition-all duration-150 cursor-pointer ${
+                        profileEmoji === emoji ? 'bg-brand-500/20 scale-110 border border-brand-500/50' : 'hover:bg-white/5 hover:scale-105'
+                      }`}
+                    >
+                      {emoji}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Action buttons */}
+              <div className="flex justify-end gap-3 pt-3 border-t border-white/5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setShowProfileModal(false)}
+                  className="px-4 py-2 text-xs font-semibold rounded-xl text-dark-300 hover:text-white transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={profileLoading}
+                  className="px-4 py-2 text-xs font-semibold rounded-xl bg-gradient-to-r from-brand-600 to-brand-500 text-white shadow-md hover:from-brand-500 hover:to-brand-600 transition-all duration-200 cursor-pointer disabled:opacity-50"
+                >
+                  {profileLoading ? 'Saving...' : 'Save Changes'}
                 </button>
               </div>
             </form>

@@ -15,6 +15,19 @@ export default function App() {
   });
   const [socket, setSocket] = useState(null);
 
+  // Intercept shareable chat links
+  useEffect(() => {
+    const path = window.location.pathname;
+    if (path.startsWith('/connect/')) {
+      const code = path.split('/connect/')[1];
+      if (code) {
+        localStorage.setItem('pending_invite_code', code.trim());
+        console.log('Intercepted invite code:', code.trim());
+      }
+      window.history.replaceState({}, document.title, '/');
+    }
+  }, []);
+
   // Initialize socket connection when user is authenticated
   useEffect(() => {
     if (token && user) {
@@ -54,6 +67,12 @@ export default function App() {
     setToken(newToken);
   };
 
+  // Handle user profile updates
+  const handleUpdateUser = (newUser) => {
+    setUser(newUser);
+    localStorage.setItem('duo_user', JSON.stringify(newUser));
+  };
+
   // Handle logout
   const handleLogout = () => {
     localStorage.removeItem('duo_token');
@@ -70,6 +89,7 @@ export default function App() {
           user={user} 
           token={token} 
           onLogout={handleLogout} 
+          onUpdateUser={handleUpdateUser}
         />
       ) : (
         <Auth onAuthSuccess={handleAuthSuccess} />

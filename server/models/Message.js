@@ -21,7 +21,30 @@ const messageSchema = new mongoose.Schema({
   read: { 
     type: Boolean, 
     default: false 
-  }
+  },
+  isEdited: {
+    type: Boolean,
+    default: false
+  },
+  isDeleted: {
+    type: Boolean,
+    default: false
+  },
+  selfDestructType: {
+    type: String,
+    enum: ['forever', 'after_read', '1h', '24h'],
+    default: 'forever'
+  },
+  destructAt: {
+    type: Date
+  },
+  reactions: [
+    {
+      userId: String,
+      username: String,
+      emoji: String
+    }
+  ]
 }, { timestamps: true });
 
 // Index for query performance on chat history between two users

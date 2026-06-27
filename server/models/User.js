@@ -21,6 +21,10 @@ const userSchema = new mongoose.Schema({
     type: String, 
     default: '💬' 
   },
+  statusMessage: {
+    type: String,
+    default: 'Available'
+  },
   online: { 
     type: Boolean, 
     default: false 
